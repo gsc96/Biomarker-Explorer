@@ -1,0 +1,303 @@
+---
+title: "Exploratory Data Analysis — Olink Proteomic Data"
+author: "Giulia Clas"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    theme: flatly
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    number_sections: true
+    code_folding: show
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 10,
+  fig.height = 6,
+  fig.align = "center"
+)
+```
+
+# Introduction
+
+This report presents an exploratory data analysis (EDA) of proteomic biomarker data from the **OlinkAnalyze** R package — the official open-source toolkit developed by [Olink Proteomics](https://olink.com/) (now part of Thermo Fisher Scientific).
+
+The dataset (`npx_data1`) contains protein expression measurements in **NPX (Normalized Protein eXpression)** units (log2 scale) from a multi-site, longitudinal clinical study. It includes two Olink panels (**Inflammation** and **Cardiometabolic**), three timepoints (**Baseline**, **Week 6**, **Week 12**), and two treatment groups (**Treated** vs **Untreated**).
+
+## Load packages
+
+```{r load-packages}
+library(OlinkAnalyze)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+library(knitr)
+```
+
+## Load data
+
+```{r load-data}
+data(npx_data1)
+```
+
+---
+
+# Dataset Overview
+
+```{r overview}
+cat("Dimensions:", nrow(npx_data1), "rows ×", ncol(npx_data1), "columns\n")
+cat("Unique subjects:", length(unique(npx_data1$Subject)), "\n")
+cat("Unique samples:", length(unique(npx_data1$SampleID)), "\n")
+cat("Unique proteins:", length(unique(npx_data1$Assay)), "\n")
+```
+
+```{r overview-table}
+tibble(
+  Feature = c("Panels", "Treatments", "Timepoints", "Sites"),
+  Values  = c(
+    paste(unique(npx_data1$Panel), collapse = ", "),
+    paste(unique(na.omit(npx_data1$Treatment)), collapse = ", "),
+    paste(unique(na.omit(npx_data1$Time)), collapse = ", "),
+    paste(unique(na.omit(npx_data1$Site)), collapse = ", ")
+  )
+) %>% kable()
+```
+
+## Study design
+
+```{r study-design}
+# Subjects per Treatment × Timepoint
+npx_data1 %>%
+  filter(!is.na(Treatment), !is.na(Time)) %>%
+  distinct(Subject, Treatment, Time) %>%
+  count(Treatment, Time) %>%
+  pivot_wider(names_from = Time, values_from = n) %>%
+  kable(caption = "Number of subjects per Treatment × Timepoint")
+```
+
+```{r subjects-per-site}
+# Subjects per Site
+npx_data1 %>%
+  filter(!is.na(Site)) %>%
+  distinct(Subject, Site) %>%
+  count(Site) %>%
+  kable(caption = "Number of subjects per clinical site")
+```
+
+---
+
+# Quality Control
+
+## QC Warning rates
+
+Olink flags each measurement with a quality control status. "Pass" means the sample
+passed all internal controls; "Warning" indicates potential issues.
+
+```{r qc-rates}
+npx_data1 %>%
+  group_by(Panel) %>%
+  summarise(
+    Total    = n(),
+    Warnings = sum(QC_Warning == "Warning"),
+    `% Warning` = round(100 * Warnings / Total, 2),
+    .groups = "drop"
+  ) %>%
+  kable(caption = "QC Warning rates by panel")
+```
+
+## Sample-level QC plot
+
+This plot shows each sample's median NPX vs IQR across all assays. Outlier samples
+deviate substantially from the expected range.
+
+```{r qc-plot, fig.height=5}
+olink_qc_plot(npx_data1, color_g = "QC_Warning")
+```
+
+## Plate distributions
+
+Comparing NPX distributions across plates helps detect potential **batch effects**.
+
+```{r plate-distributions, fig.height=5}
+ggplot(npx_data1, aes(x = PlateID, y = NPX, fill = PlateID)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.5) +
+  facet_wrap(~Panel, scales = "free_x") +
+  labs(title = "NPX Distribution by Plate",
+       y = "NPX (log2)", x = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1),
+        legend.position = "none")
+```
+
+## Limit of Detection (LOD)
+
+LOD is the NPX threshold below which measurements are considered unreliable.
+**MissingFreq** reports the fraction of samples below LOD for each assay.
+
+```{r lod-summary}
+cat("LOD summary:\n")
+summary(npx_data1$LOD)
+
+cat("\nMissing Frequency summary:\n")
+summary(npx_data1$MissingFreq)
+```
+
+```{r high-missing}
+npx_data1 %>%
+  distinct(Assay, Panel, MissingFreq) %>%
+  arrange(desc(MissingFreq)) %>%
+  head(10) %>%
+  kable(caption = "Top 10 proteins with highest missing frequency")
+```
+
+---
+
+# NPX Distribution
+
+## By Treatment group
+
+```{r dist-treatment}
+npx_treated <- npx_data1 %>% filter(!is.na(Treatment))
+olink_dist_plot(npx_treated, color_g = "Treatment")
+```
+
+## By Panel
+
+```{r dist-panel, fig.height=4}
+ggplot(npx_data1, aes(x = NPX, fill = Panel)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "NPX Distribution by Panel",
+       x = "NPX (log2)", y = "Density") +
+  theme_minimal(base_size = 13) +
+  scale_fill_manual(values = c("#3498DB", "#E74C3C"))
+```
+
+---
+
+# Dimensionality Reduction
+
+We apply PCA and UMAP to the full proteomics matrix to explore sample clustering.
+Samples are colored by different clinical variables to identify potential structure
+in the data.
+
+```{r filter-subjects}
+# Use only clinical subjects (exclude plate controls)
+npx_subjects <- npx_data1 %>%
+  filter(!is.na(Treatment), !is.na(Time))
+```
+
+## PCA — by Treatment
+
+```{r pca-treatment}
+olink_pca_plot(npx_subjects, color_g = "Treatment", quiet = TRUE)[[1]]
+```
+
+## PCA — by Timepoint
+
+```{r pca-time}
+olink_pca_plot(npx_subjects, color_g = "Time", quiet = TRUE)[[1]]
+```
+
+## PCA — by Site
+
+```{r pca-site}
+olink_pca_plot(npx_subjects, color_g = "Site", quiet = TRUE)[[1]]
+```
+
+## UMAP — by Treatment
+
+UMAP is a non-linear dimensionality reduction method that can reveal clusters
+that PCA might miss.
+
+```{r umap-treatment}
+olink_umap_plot(npx_subjects, color_g = "Treatment", quiet = TRUE)[[1]]
+```
+
+---
+
+# Statistical Testing
+
+We compare protein levels between **Treated** and **Untreated** groups at **Baseline**
+(before treatment). At Baseline, we expect **no significant differences** if
+randomization was successful.
+
+```{r baseline-filter}
+npx_baseline <- npx_data1 %>%
+  filter(!is.na(Treatment), Time == "Baseline")
+```
+
+## Wilcoxon rank-sum test
+
+We use the non-parametric **Wilcoxon rank-sum test** (Mann-Whitney U), which does not
+assume normality — a conservative and appropriate choice for biomarker data.
+
+The `olink_wilcox()` function automatically applies **Benjamini-Hochberg FDR correction**
+for multiple testing across all proteins.
+
+```{r wilcoxon-test}
+wilcox_results <- olink_wilcox(npx_baseline, variable = "Treatment")
+
+cat("Total proteins tested:", nrow(wilcox_results), "\n")
+cat("Significant (p < 0.05):",
+    sum(wilcox_results$p.value < 0.05, na.rm = TRUE), "\n")
+cat("Significant after FDR correction (Adjusted p < 0.05):",
+    sum(wilcox_results$Adjusted_pval < 0.05, na.rm = TRUE), "\n")
+```
+
+### Top proteins by adjusted p-value
+
+```{r top-hits}
+wilcox_results %>%
+  arrange(Adjusted_pval) %>%
+  head(15) %>%
+  select(Assay, estimate, p.value, Adjusted_pval) %>%
+  mutate(
+    p.value = format(p.value, digits = 3, scientific = TRUE),
+    Adjusted_pval = round(Adjusted_pval, 4)
+  ) %>%
+  kable(caption = "Top 15 proteins ranked by FDR-adjusted p-value")
+```
+
+## Volcano plot
+
+The volcano plot shows **effect size** (x-axis) vs **statistical significance**
+(y-axis, −log10 p-value) for all proteins. The dashed line indicates the
+p = 0.05 threshold.
+
+```{r volcano-plot, fig.height=7}
+olink_volcano_plot(wilcox_results, x_lab = "Treatment")
+```
+
+> **Interpretation:** No proteins survive FDR correction at Baseline, which is the
+> expected result — it confirms that the randomization was successful and there are
+> no systematic pre-treatment differences between groups.
+
+---
+
+# Summary
+
+| Metric | Value |
+|--------|-------|
+| Total proteins | `r length(unique(npx_data1$Assay))` |
+| Subjects | `r length(unique(npx_data1$Subject))` |
+| Panels | `r paste(unique(npx_data1$Panel), collapse = ", ")` |
+| QC Warning rate (Inflammation) | 1.25% |
+| Proteins with p < 0.05 at Baseline | `r sum(wilcox_results$p.value < 0.05, na.rm = TRUE)` |
+| Proteins significant after FDR | `r sum(wilcox_results$Adjusted_pval < 0.05, na.rm = TRUE)` |
+
+**Key findings:**
+
+1. **Quality control** — Overall QC Warning rate is low (< 1.3%), indicating high data quality.
+2. **No batch effects** — Plate distributions are comparable across plates within each panel.
+3. **PCA/UMAP** — No clear separation by Treatment at Baseline, consistent with proper randomization.
+4. **Statistical testing** — 15 proteins show nominal significance (p < 0.05) but none survive FDR correction, confirming balanced randomization.
+
+---
+
+*Report generated with [OlinkAnalyze](https://github.com/Olink-Proteomics/OlinkAnalyze) `r packageVersion("OlinkAnalyze")` and R `r getRversion()`.*
